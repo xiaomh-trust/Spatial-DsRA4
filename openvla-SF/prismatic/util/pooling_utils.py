@@ -50,15 +50,21 @@ def interpolate_pooling(hidden, patch_hw, img_hw, reference, pooling_func, use_v
     (patch_h, patch_w) = patch_hw
     (img_h, img_w) = img_hw
     bs, N, S, D = hidden.shape
-    re_sample_ratio = 1 / np.sqrt(N * S / reference.shape[1])
+    # [Spatial-DsRA v4]: Explicit per-view square VLA grid avoids scale-factor rounding errors.
+    import math
+    tokens_per_view, remainder = divmod(reference.shape[1], N)
+    side = math.isqrt(tokens_per_view)
+    if remainder or side * side != tokens_per_view or S != patch_h * patch_w:
+        raise ValueError("Teacher patch grid and per-view VLA token grid do not match")
 
     _hidden = hidden.permute(0, 1, 3, 2)
     _hidden = _hidden.reshape(bs*N, D, patch_h, patch_w)
-    if use_vggt_pe:
-        _hidden = _apply_pos_embed(_hidden, img_w, img_h)
     hidden_pooling = _interpolate(
-        _hidden, scale_factor=re_sample_ratio, mode=pooling_func, align_corners=True
+        _hidden, size=(side, side), mode=pooling_func, align_corners=True
     )
+    # [Spatial-DsRA v4]: Y = bilinear(Z) + E on the destination visual grid.
+    if use_vggt_pe:
+        hidden_pooling = _apply_pos_embed(hidden_pooling, img_w, img_h)
     hidden_pooling = hidden_pooling.reshape(bs, N, D, -1).permute(0, 1, 3, 2).reshape(bs, -1, D)
     return hidden_pooling
 

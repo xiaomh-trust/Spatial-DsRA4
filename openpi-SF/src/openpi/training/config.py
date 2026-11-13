@@ -473,6 +473,16 @@ class TrainConfig:
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
 
+    # [Spatial-DsRA v4]: Explicit experiment settings; no stage lengths/eta/LR ratio are given in v4.
+    spatial_warmup_steps: int | None = None
+    spatial_absorption_start: int | None = None
+    spatial_orth_coeff: float | None = None
+    spatial_basis_lr_scale: float | None = None
+    spatial_bottleneck_dim: int = 256
+    spatial_rank: int = 32
+    spatial_temperature: float = 1.0
+    spatial_allocation_floor: float = 0.0
+
     # Spatial Forcing configs
     vggt_weight_path: str | None = None
     vggt_dim: int = 1024

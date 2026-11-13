@@ -46,6 +46,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
+from openpi.models_pytorch.spatial_dsra import SpatialDsRAProjector, spatial_stage
 from vggt.models.vggt import VGGT
 
 
@@ -148,7 +149,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, align_projector):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -166,7 +167,20 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        # [Spatial-DsRA v4]: Save training state separately; export merged weights for unchanged inference.
+        from peft.tuners.lora import LoraLayer
+        torch.save(model_to_save.state_dict(), tmp_ckpt_dir / "training_model.pt")
+        torch.save(get_model_state_dict(align_projector), tmp_ckpt_dir / "spatial_dsra.pt")
+        merged = dict(model_to_save.state_dict())
+        for name, module in model_to_save.named_modules():
+            if isinstance(module, LoraLayer):
+                merged[name + ".weight"] = module.base_layer.weight.detach() + module.get_delta_weight("default").detach()
+                if module.base_layer.bias is not None:
+                    merged[name + ".bias"] = module.base_layer.bias.detach()
+                for key in list(merged):
+                    if key.startswith(name + ".base_layer.") or key.startswith(name + ".lora_"):
+                        del merged[key]
+        safetensors.torch.save_file({k: v.detach().cpu().contiguous().clone() for k, v in merged.items()}, tmp_ckpt_dir / "model.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -196,7 +210,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, align_projector):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -219,12 +233,15 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
+        # [Spatial-DsRA v4]: Restore unmerged adapters and the same shared spatial mapping.
+        training_path = ckpt_dir / "training_model.pt"
 
-        if safetensors_path.exists():
+        if training_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-            logging.info("Loaded model state from safetensors format")
+            model_to_load.load_state_dict(torch.load(training_path, map_location=device, weights_only=True))
+            aux = align_projector.module if isinstance(align_projector, torch.nn.parallel.DistributedDataParallel) else align_projector
+            aux.load_state_dict(torch.load(ckpt_dir / "spatial_dsra.pt", map_location=device, weights_only=True))
+            logging.info("Loaded Spatial-DsRA v4 training state")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
 
@@ -416,10 +433,20 @@ def train_loop(config: _config.TrainConfig):
         enable_track=False,
         feature_only=True,
     ).to(device)
-    align_projector = projectors.AlignProjector(
-        model.LLM_width,
-        config.vggt_dim,
-        config.use_vlm_norm).to(device)
+    # [Spatial-DsRA v4]: Fail early rather than invent experiment-specific schedule/weights.
+    if any(x is None for x in (config.spatial_warmup_steps, config.spatial_absorption_start,
+                              config.spatial_orth_coeff, config.spatial_basis_lr_scale)):
+        raise ValueError("Set spatial_warmup_steps, spatial_absorption_start, spatial_orth_coeff, spatial_basis_lr_scale")
+    spatial_stage(0, config.spatial_warmup_steps, config.spatial_absorption_start)
+    if not 0 < config.spatial_basis_lr_scale < 1 or config.spatial_orth_coeff < 0:
+        raise ValueError("Require 0 < spatial_basis_lr_scale < 1 and spatial_orth_coeff >= 0")
+    if config.vggt_weight_path is None:
+        raise ValueError("Spatial-DsRA v4 requires pretrained VGGT weights")
+    align_projector = SpatialDsRAProjector(
+        model.LLM_width, 2 * vggt_model.embed_dim,
+        len(model.paligemma_with_expert.paligemma.language_model.layers),
+        config.spatial_bottleneck_dim, config.spatial_rank,
+        config.spatial_temperature, config.spatial_allocation_floor).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -442,22 +469,6 @@ def train_loop(config: _config.TrainConfig):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
-    if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
-        )
-        align_projector = torch.nn.parallel.DistributedDataParallel(
-            align_projector,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
-        )
-
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
@@ -475,6 +486,31 @@ def train_loop(config: _config.TrainConfig):
         vggt_model.load_state_dict(torch.load(vggt_path), strict=False)
         logging.info(f"Loaded VGGT weights from {config.vggt_weight_path}")
 
+    # [Spatial-DsRA v4]: Q/V LoRA on the VLM; the existing action expert/head stays trainable.
+    from peft import LoraConfig, inject_adapter_in_model
+    model.paligemma_with_expert.paligemma.requires_grad_(False)
+    inject_adapter_in_model(
+        LoraConfig(r=32, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0),
+        model.paligemma_with_expert.paligemma.language_model,
+    )
+    vggt_model.eval().requires_grad_(False)
+
+    if use_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=True,  # Disable for memory efficiency
+            gradient_as_bucket_view=True,  # Enable for memory efficiency
+            static_graph=False,  # Enable for 8+ GPUs
+        )
+        align_projector = torch.nn.parallel.DistributedDataParallel(
+            align_projector,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=True,  # Disable for memory efficiency
+            gradient_as_bucket_view=True,  # Enable for memory efficiency
+            static_graph=False,  # Enable for 8+ GPUs
+        )
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -482,8 +518,15 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        list(model.parameters()) + list(align_projector.parameters()),
+    # [Spatial-DsRA v4]: Keep both groups registered across all three training stages.
+    aux = align_projector.module if use_ddp else align_projector
+    slow = [aux.basis, aux.rho]
+    fast = [p for p in aux.parameters() if all(p is not q for q in slow)]
+    optim = torch.optim.AdamW([
+        {"params": [p for p in model.parameters() if p.requires_grad] + fast, "lr_scale": 1.0},
+        {"params": slow, "lr": peak_lr * config.spatial_basis_lr_scale,
+         "lr_scale": config.spatial_basis_lr_scale},
+    ],
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -493,7 +536,7 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, align_projector)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -552,11 +595,13 @@ def train_loop(config: _config.TrainConfig):
 
             # Update LR
             for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+                pg["lr"] = lr_schedule(global_step) * pg["lr_scale"]
 
             # Forward pass
-            action_losses, align_loss = model(observation, actions, vggt=vggt_model, align_proj=align_projector)
-            loss = action_losses + config.align_loss_coeff * align_loss
+            # [Spatial-DsRA v4]: Freezing auxiliary weights must not detach the VLM hidden states.
+            aux.set_stage(spatial_stage(global_step, config.spatial_warmup_steps, config.spatial_absorption_start))
+            action_losses, align_loss, orth_loss = model(observation, actions, vggt=vggt_model, align_proj=align_projector)
+            loss = action_losses + config.align_loss_coeff * align_loss + config.spatial_orth_coeff * orth_loss
 
             # Backward pass
             loss.backward()
@@ -628,7 +673,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, align_projector)
 
             # Update progress bar
             if pbar is not None:

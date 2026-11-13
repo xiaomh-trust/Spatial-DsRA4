@@ -122,8 +122,8 @@ class PI0Pytorch(nn.Module):
         # Specific config for SpatialForcing alignment
         self.vla_layers_align = extra_config.vla_layers_align
         self.vggt_layers_align = extra_config.vggt_layers_align
-        self.pooling_func = extra_config.pooling_func
-        self.use_vggt_pe = extra_config.use_vggt_pe
+        self.pooling_func = "bilinear"  # [Spatial-DsRA v4]: Defined teacher resampling.
+        self.use_vggt_pe = True  # [Spatial-DsRA v4]: Y = Z_res + E.
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
@@ -398,10 +398,11 @@ class PI0Pytorch(nn.Module):
         # =================================== Alignment loss ===================================
 
         # VLA hidden states
-        (prefix_hidden, _) = all_hidden_states[self.vla_layers_align]  # 18 total layers of paligemma
-        vision_hidden = prefix_hidden[:, :img_len, :]
+        # [Spatial-DsRA v4]: Exclude embedding H_0 and all suffix/language tokens; retain all L outputs.
+        vision_hidden = tuple(prefix[:, :img_len, :] for prefix, _ in all_hidden_states[1:])
 
         # VGGT hidden states
+        vggt.eval().requires_grad_(False)  # [Spatial-DsRA v4]: Frozen teacher.
         with torch.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
             vggt_output = vggt(img_resize_wo_aug)
         agg_vggt_hidden = vggt_output["features"][self.vggt_layers_align]  # 24 for total layers of VGGT
@@ -413,7 +414,7 @@ class PI0Pytorch(nn.Module):
         H, W = original_img.shape[-2:]
         patch_h, patch_w = H // vggt.patch_size, W // vggt.patch_size
         vggt_hidden = custom_pooling(
-            vggt_hidden, (patch_h, patch_w), (H, W), vision_hidden, self.pooling_func, self.use_vggt_pe
+            vggt_hidden, (patch_h, patch_w), (H, W), vision_hidden[0], self.pooling_func, self.use_vggt_pe
         )
 
         # empty image feature masks for alignment loss
@@ -435,9 +436,9 @@ class PI0Pytorch(nn.Module):
 
         # calculate align loss
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            align_loss = align_proj(vision_hidden, vggt_hidden, align_mask)
+            align_loss, orth_loss = align_proj(vision_hidden, vggt_hidden, align_mask)
 
-        return action_loss, align_loss
+        return action_loss, align_loss, orth_loss  # [Spatial-DsRA v4]: Separate objective weights.
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

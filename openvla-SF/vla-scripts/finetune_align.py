@@ -5,6 +5,7 @@ Fine-tunes OpenVLA via LoRA.
 """
 
 import os
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from huggingface_hub import HfApi, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import MultiStepLR, LambdaLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -65,6 +66,7 @@ from prismatic.vla.constants import (
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
+from prismatic.models.spatial_dsra import SpatialDsRAProjector, spatial_stage
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import preprocess_normed_images
 
@@ -76,6 +78,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class FinetuneConfig:
     # fmt: off
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
+    # [Spatial-DsRA v4]: Required experiment settings; the design does not specify these values.
+    spatial_warmup_steps: Optional[int] = None
+    spatial_absorption_start: Optional[int] = None
+    spatial_orth_coeff: Optional[float] = None
+    spatial_basis_lr_scale: Optional[float] = None
+    spatial_bottleneck_dim: int = 256
+    spatial_rank: int = 32
+    spatial_temperature: float = 1.0
+    spatial_allocation_floor: float = 0.0
+
     vggt_path: str = 'official_ckpts/vggt_model.pt'  # Path to VGGT model (on HuggingFace Hub or stored locally)
 
     # Dataset
@@ -97,7 +109,7 @@ class FinetuneConfig:
     vla_layers_align: int = -1                       # which layer of the VLA hidden state to align, 33 for total
     vggt_layers_align: int = -1                      # which layer of the VGGT hidden state to align, 24 for total
     use_vlm_norm: bool = False                       # whether to use VLM normalization for the VLM output vision embeddings
-    use_vggt_pe: bool = False                        # position embedding for vggt state before pooling
+    use_vggt_pe: bool = True                        # position embedding for vggt state before pooling
     gain_feat_1move: bool = True                     # whether to gain the VLA feature moved one position backward
 
     # Training configuration
@@ -307,6 +319,7 @@ def run_forward_pass(
     num_images_in_input=2,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    spatial_orth_coeff=0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -371,11 +384,9 @@ def run_forward_pass(
     next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
     # vla hidden states
-    projected_embeddings = output.projector_features
-    vision_length = projected_embeddings.shape[-2] - 1 if use_proprio else projected_embeddings.shape[-2]
-    vla_hidden = output.hidden_states[layers_align[0]]  # 33 for total layers of VLA-7B
-    boi_ids = 2 if gain_feat_1move else 1
-    vision_hidden = vla_hidden[:, boi_ids: vision_length+boi_ids, :].clone()  # [bs, 512, 4096]
+    # [Spatial-DsRA v4]: Exclude embedding state H_0, BOS, proprio and diffusion time tokens.
+    vision_length = vla.module.vision_backbone.get_num_patches() * num_images_in_input
+    vision_hidden = tuple(h[:, 1:1 + vision_length, :] for h in output.hidden_states[1:])
 
     # VGGT hidden states
     vggt.eval()
@@ -392,11 +403,11 @@ def run_forward_pass(
     # Resample VGGT hidden states to match the resolution of VLA hidden states
     H, W = original_img.shape[-2:]
     patch_h, patch_w = H // vggt.patch_size, W // vggt.patch_size
-    vggt_hidden = custom_pooling(vggt_hidden, (patch_h, patch_w), (H, W), vision_hidden, pooling_func, use_vggt_pe)
+    vggt_hidden = custom_pooling(vggt_hidden, (patch_h, patch_w), (H, W), vision_hidden[0], pooling_func, use_vggt_pe)
 
     # calculate align loss
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        align_loss = align_projector(vision_hidden, vggt_hidden)
+        align_loss, orth_loss = align_projector(vision_hidden, vggt_hidden)
     
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
@@ -494,7 +505,9 @@ def run_forward_pass(
             )
 
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
-    return loss + align_loss * align_loss_coeff, metrics
+    # [Spatial-DsRA v4]: Preserve original action objective; add single alignment and orthogonality.
+    metrics["orth_loss"] = orth_loss.item()
+    return loss + align_loss * align_loss_coeff + spatial_orth_coeff * orth_loss, metrics
 
 
 def run_diffusion_sampling(
@@ -737,6 +750,9 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    align_projector,
+    vggt,
+    processor,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -773,6 +789,17 @@ def run_validation(
                 action_head=action_head,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
+                # [Spatial-DsRA v4]: Validation uses the same fused objective and teacher mapping.
+                align_projector=align_projector,
+                vggt=vggt,
+                processor=processor,
+                pooling_func=cfg.pooling_func,
+                layers_align=(cfg.vla_layers_align, cfg.vggt_layers_align),
+                use_vggt_pe=cfg.use_vggt_pe,
+                gain_feat_1move=cfg.gain_feat_1move,
+                align_loss_coeff=cfg.align_loss_coeff,
+                spatial_orth_coeff=cfg.spatial_orth_coeff,
+                num_images_in_input=cfg.num_images_in_input,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -825,6 +852,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
+    # [Spatial-DsRA v4]: Reject configurations that silently change the specified objective.
+    if any(x is None for x in (cfg.spatial_warmup_steps, cfg.spatial_absorption_start,
+                              cfg.spatial_orth_coeff, cfg.spatial_basis_lr_scale)):
+        raise ValueError("Set spatial_warmup_steps, spatial_absorption_start, spatial_orth_coeff, spatial_basis_lr_scale")
+    spatial_stage(0, cfg.spatial_warmup_steps, cfg.spatial_absorption_start)
+    if not 0 < cfg.spatial_basis_lr_scale < 1 or cfg.spatial_orth_coeff < 0:
+        raise ValueError("Require 0 < spatial_basis_lr_scale < 1 and spatial_orth_coeff >= 0")
+    if not cfg.use_vggt_pe or cfg.pooling_func != "bilinear" or cfg.align_loss_type != "cosine":
+        raise ValueError("Spatial-DsRA v4 requires bilinear resampling, positional encoding and cosine loss")
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
@@ -907,7 +943,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
+            # [Spatial-DsRA v4]: LoRA only on language attention Wq/Wv.
+            target_modules=r"language_model\.model\.layers\.\d+\.self_attn\.(q_proj|v_proj)",
             init_lora_weights="gaussian",
         )
         vla = get_peft_model(vla, lora_config)
@@ -942,14 +979,20 @@ def finetune(cfg: FinetuneConfig) -> None:
         feature_only=True,
     )
     vggt_model.load_state_dict(torch.load(cfg.vggt_path), strict=False)
-    vggt_model = vggt_model.to(device_id)
+    # [Spatial-DsRA v4]: Fully freeze the spatial teacher.
+    vggt_model = vggt_model.to(device_id).eval().requires_grad_(False)
 
     align_projector = init_module(
-        AlignProjector, "align_projector", cfg, device_id,
+        # [Spatial-DsRA v4]: VGGT concatenates frame/global features: d_g = 2 * embed_dim.
+        SpatialDsRAProjector, "align_projector", cfg, device_id,
         {"llm_dim": vla.module.llm_dim,
-         "vggt_dim": vggt_model.embed_dim,
-         "align_loss_type": cfg.align_loss_type,
-         "use_vlm_norm": cfg.use_vlm_norm,}
+         "vggt_dim": 2 * vggt_model.embed_dim,
+         "num_layers": vla.module.config.text_config.num_hidden_layers,
+         "bottleneck_dim": cfg.spatial_bottleneck_dim,
+         "rank": cfg.spatial_rank,
+         "temperature": cfg.spatial_temperature,
+         "allocation_floor": cfg.spatial_allocation_floor},
+        find_unused_params=True,
     )
 
     # If applicable, instantiate proprio projector
@@ -1005,14 +1048,20 @@ def finetune(cfg: FinetuneConfig) -> None:
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     if cfg.use_l1_regression or cfg.use_diffusion:
         trainable_params += [param for param in action_head.parameters() if param.requires_grad]
-    if cfg.align_loss_type in ["cosine"]:
-        trainable_params += [param for param in align_projector.parameters() if param.requires_grad]
     if cfg.use_diffusion:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+    # [Spatial-DsRA v4]: Register all auxiliary parameters before freezing, so Stage II can unfreeze.
+    aux = align_projector.module
+    spatial_slow = [aux.basis, aux.rho]
+    spatial_fast = [p for p in aux.parameters() if all(p is not q for q in spatial_slow)]
+    optimizer = AdamW([
+        {"params": trainable_params + spatial_fast, "lr_scale": 1.0},
+        {"params": spatial_slow, "lr": cfg.learning_rate * cfg.spatial_basis_lr_scale,
+         "lr_scale": cfg.spatial_basis_lr_scale},
+    ], lr=cfg.learning_rate)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
@@ -1025,10 +1074,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             gamma=0.1,  # Multiplicative factor of learning rate decay
         )
     elif cfg.scheduler == 'CosineAnnealingLR':
-        scheduler = CosineAnnealingLR(
+        # [Spatial-DsRA v4]: A relative cosine floor preserves the smaller M/rho learning rate.
+        scheduler = LambdaLR(
             optimizer,
-            T_max=cfg.max_steps,  # Total number of steps for the cosine annealing
-            eta_min=cfg.learning_rate * 1e-3,
+            lr_lambda=lambda step: 1e-3 + (1 - 1e-3) * (1 + math.cos(math.pi * step / cfg.max_steps)) / 2,
         )
     else:
         raise ValueError(f"Unsupported scheduler type: {cfg.scheduler}")
@@ -1115,6 +1164,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "orth_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "align_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
@@ -1123,6 +1173,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            # [Spatial-DsRA v4]: Switch only at optimizer-step boundaries, including resumed runs.
+            spatial_step = batch_idx // cfg.grad_accumulation_steps + (cfg.resume_step if cfg.resume else 0)
+            aux.set_stage(spatial_stage(spatial_step, cfg.spatial_warmup_steps, cfg.spatial_absorption_start))
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
@@ -1141,6 +1194,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
                 align_loss_coeff=cfg.align_loss_coeff,
+                spatial_orth_coeff=cfg.spatial_orth_coeff,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
@@ -1178,7 +1232,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
+                    # [Spatial-DsRA v4]: Preserve the rank/basis LR ratio during warm-up as well.
+                    param_group["lr"] = current_lr * param_group["lr_scale"]
 
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log the learning rate
@@ -1230,6 +1285,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    vggt=vggt_model,
+                    processor=processor,
                 )
                 # Set model back to training mode after validation
                 vla.train()
